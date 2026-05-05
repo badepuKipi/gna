@@ -77,11 +77,7 @@ jobs:
       
       - name: Create Private Key
         run: |
-          mkdir -p ~/.snowflake
-          cat <<EOT > ~/.snowflake/sf_private_key.p8
-          ${{ secrets.PRIVATE_KEY_PATH }}
-          EOT
-          chmod 0600 ~/.snowflake/sf_private_key.p8
+          echo "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > sf_private_key.p8
       
       - name: Run code review analysis
         run: python code_review_scripts/main.py pr_files_to_review ${{ steps.generate_dir_name.outputs.DYNAMIC_OUTPUT_DIR }} ${{ github.event.pull_request.number }} ${{ github.event.pull_request.head.sha }}
