@@ -1,0 +1,198 @@
+name: PR Status Tracking
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  track-pr-status:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install snowflake-connector-python snowflake-snowpark-python cryptography
+      
+      - name: Create Private Key
+        run: |
+          mkdir -p ~/.snowflake
+          cat <<EOT > ~/.snowflake/sf_private_key.p8
+          ${{ secrets.PRIVATE_KEY_PATH }}
+          EOT
+          chmod 0600 ~/.snowflake/sf_private_key.p8
+      
+      - name: Track PR Status in Snowflake
+        run: |
+          python - <<'EOF'
+          import os
+          import sys
+          from snowflake.snowpark import Session
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.backends import default_backend
+          
+          PRIVATE_KEY_PATH = os.path.expanduser("~/.snowflake/sf_private_key.p8")
+          
+          def load_private_key(path=PRIVATE_KEY_PATH):
+              with open(path, "rb") as key_file:
+                  p_key = serialization.load_pem_private_key(
+                      key_file.read(),
+                      password=None,
+                      backend=default_backend()
+                  )
+              pkb = p_key.private_bytes(
+                  encoding=serialization.Encoding.DER,
+                  format=serialization.PrivateFormat.PKCS8,
+                  encryption_algorithm=serialization.NoEncryption()
+              )
+              return pkb
+          
+          try:
+              event_name = "${{ github.event_name }}"
+              
+              if event_name == "workflow_dispatch":
+                  print("⚠️ Manual trigger - using test data")
+                  pr_number = 9999
+                  pr_creator = "${{ github.actor }}"
+                  repository = "${{ github.repository }}"
+                  pr_created_at = "2025-01-01T00:00:00Z"
+                  event_action = "opened"
+                  actor = "${{ github.actor }}"
+              else:
+                  pr_number = int("${{ github.event.pull_request.number }}")
+                  pr_creator = "${{ github.event.pull_request.user.login }}"
+                  repository = "${{ github.repository }}"
+                  pr_created_at = "${{ github.event.pull_request.created_at }}"
+                  event_action = "${{ github.event.action }}"
+                  actor = "${{ github.actor }}"
+              
+              is_closing = event_action == "closed"
+              pr_status = "CLOSED" if is_closing else "ACTIVE"
+              
+              print(f"Tracking PR #{pr_number} as {pr_status}")
+              print(f"Action: {event_action}, Actor: {actor}, Creator: {pr_creator}")
+              
+              private_key_bytes = load_private_key()
+              
+              cfg = {
+                  "account": os.getenv("SNOWFLAKE_ACCOUNT"),
+                  "user": os.getenv("SNOWFLAKE_USER"),
+                  "private_key": private_key_bytes,
+                  "authenticator": "SNOWFLAKE_JWT",
+                  "role": "SYSADMIN",
+                  "warehouse": "COMPUTE_WH",
+                  "database": "MY_DB",
+                  "schema": "PUBLIC",
+              }
+              
+              session = Session.builder.configs(cfg).create()
+              print(f"✅ Connected to Snowflake: {cfg['account']} as {cfg['user']}")
+              
+              create_table_query = """
+              CREATE TABLE IF NOT EXISTS MY_DB.PUBLIC.PR_STATUS_TRACKING (
+                  PR_TRACKING_ID INTEGER AUTOINCREMENT START 1 INCREMENT 1,
+                  PULL_REQUEST_NUMBER INTEGER NOT NULL,
+                  REPOSITORY_NAME VARCHAR(255),
+                  PR_STATUS VARCHAR(20) NOT NULL,
+                  PR_CREATOR VARCHAR(100),
+                  PR_CREATED_AT TIMESTAMP_NTZ,
+                  PR_CLOSED_BY VARCHAR(100),
+                  PR_CLOSED_AT TIMESTAMP_NTZ,
+                  LAST_UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                  PRIMARY KEY (PR_TRACKING_ID)
+              )
+              """
+              session.sql(create_table_query).collect()
+              print("✅ PR_STATUS_TRACKING table ready")
+              
+              check_query = """
+              SELECT COUNT(*) as count
+              FROM MY_DB.PUBLIC.PR_STATUS_TRACKING
+              WHERE PULL_REQUEST_NUMBER = ? AND REPOSITORY_NAME = ?
+              """
+              result = session.sql(check_query, params=[pr_number, repository]).collect()
+              exists = result[0]['COUNT'] > 0
+              
+              if is_closing:
+                  if exists:
+                      update_query = """
+                      UPDATE MY_DB.PUBLIC.PR_STATUS_TRACKING
+                      SET PR_STATUS = 'CLOSED',
+                          PR_CLOSED_BY = ?,
+                          PR_CLOSED_AT = CURRENT_TIMESTAMP(),
+                          LAST_UPDATED_AT = CURRENT_TIMESTAMP()
+                      WHERE PULL_REQUEST_NUMBER = ?
+                      AND REPOSITORY_NAME = ?
+                      """
+                      session.sql(update_query, params=[actor, pr_number, repository]).collect()
+                      print(f"✅ Updated PR #{pr_number} to CLOSED by {actor}")
+                  else:
+                      insert_query = """
+                      INSERT INTO MY_DB.PUBLIC.PR_STATUS_TRACKING
+                      (PULL_REQUEST_NUMBER, REPOSITORY_NAME, PR_STATUS, PR_CREATOR, PR_CREATED_AT, PR_CLOSED_BY, PR_CLOSED_AT)
+                      VALUES (?, ?, 'CLOSED', ?, TO_TIMESTAMP_NTZ(?), ?, CURRENT_TIMESTAMP())
+                      """
+                      session.sql(insert_query, params=[pr_number, repository, pr_creator, pr_created_at, actor]).collect()
+                      print(f"✅ Inserted PR #{pr_number} as CLOSED")
+              else:
+                  if not exists:
+                      insert_query = """
+                      INSERT INTO MY_DB.PUBLIC.PR_STATUS_TRACKING
+                      (PULL_REQUEST_NUMBER, REPOSITORY_NAME, PR_STATUS, PR_CREATOR, PR_CREATED_AT)
+                      VALUES (?, ?, 'ACTIVE', ?, TO_TIMESTAMP_NTZ(?))
+                      """
+                      session.sql(insert_query, params=[pr_number, repository, pr_creator, pr_created_at]).collect()
+                      print(f"✅ Inserted PR #{pr_number} as ACTIVE")
+                  else:
+                      update_query = """
+                      UPDATE MY_DB.PUBLIC.PR_STATUS_TRACKING
+                      SET PR_STATUS = 'ACTIVE',
+                          PR_CLOSED_BY = NULL,
+                          PR_CLOSED_AT = NULL,
+                          LAST_UPDATED_AT = CURRENT_TIMESTAMP()
+                      WHERE PULL_REQUEST_NUMBER = ?
+                      AND REPOSITORY_NAME = ?
+                      """
+                      session.sql(update_query, params=[pr_number, repository]).collect()
+                      print(f"✅ Updated PR #{pr_number} to ACTIVE")
+              
+              verify_query = """
+              SELECT PR_TRACKING_ID, PR_STATUS, PR_CREATOR, PR_CREATED_AT, PR_CLOSED_BY, PR_CLOSED_AT, LAST_UPDATED_AT
+              FROM MY_DB.PUBLIC.PR_STATUS_TRACKING
+              WHERE PULL_REQUEST_NUMBER = ? AND REPOSITORY_NAME = ?
+              """
+              verify_result = session.sql(verify_query, params=[pr_number, repository]).collect()
+              
+              if verify_result:
+                  row = verify_result[0]
+                  print(f"\n📋 Verification:")
+                  print(f"   Tracking ID: {row['PR_TRACKING_ID']}")
+                  print(f"   Status: {row['PR_STATUS']}")
+                  print(f"   Creator: {row['PR_CREATOR']}")
+                  print(f"   Created At: {row['PR_CREATED_AT']}")
+                  print(f"   Closed By: {row['PR_CLOSED_BY']}")
+                  print(f"   Closed At: {row['PR_CLOSED_AT']}")
+                  print(f"   Last Updated: {row['LAST_UPDATED_AT']}")
+              
+              session.close()
+              print(f"\n✅ PR #{pr_number} tracking completed")
+              
+          except Exception as e:
+              print(f"❌ Error: {e}")
+              import traceback
+              traceback.print_exc()
+              sys.exit(0)
+          EOF
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
