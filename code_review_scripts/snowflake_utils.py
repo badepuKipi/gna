@@ -8,41 +8,48 @@ from cryptography.hazmat.backends import default_backend
 PRIVATE_KEY_PATH = os.path.expanduser("~/.snowflake/sf_private_key.p8")
 
 def load_private_key(path=PRIVATE_KEY_PATH):
-    """Load private key and convert to DER bytes for Snowflake"""
-
-    # 1. Get the password string from the environment
+    """Load private key - supports file (local) and base64 env variable (GitHub Actions)"""
+    
     env_password = os.getenv("PRIVATE_KEY_PASSWORD")
-    
-    # 2. Convert the string to bytes ONLY if it's not None
-    key_password_bytes = None
-    if env_password:
-        key_password_bytes = env_password.encode('utf-8')
+    key_password_bytes = env_password.encode('utf-8') if env_password else None
 
-    with open(path, "rb") as key_file:
-        key_data = key_file.read()
-        
-        # Try loading without password first
-        try:
-            p_key = serialization.load_pem_private_key(
-                key_data,
-                password=None,
-                backend=default_backend()
-            )
-        except TypeError:
-            # Key is encrypted, need password
-            if key_password_bytes is None:
-                print("❌ Private key is encrypted but PRIVATE_KEY_PASSWORD environment variable is not set")
-                print("Please set PRIVATE_KEY_PASSWORD environment variable or use an unencrypted key")
-                sys.exit(1)
-            
-            # Try with password
-            p_key = serialization.load_pem_private_key(
-                key_data,
-                password=key_password_bytes,
-                backend=default_backend()
-            )
+    # ✅ GitHub Actions mode - load from base64 environment variable
+    private_key_b64 = os.getenv("SNOWFLAKE_PRIVATE_KEY_BASE64")
     
-    # Convert to bytes for Snowflake connector
+    if private_key_b64:
+        print("🔑 Loading private key from SNOWFLAKE_PRIVATE_KEY_BASE64 (GitHub Actions mode)")
+        import base64
+        key_data = base64.b64decode(private_key_b64)
+    
+    # ✅ Local dev mode - load from file
+    elif os.path.exists(path):
+        print(f"🔑 Loading private key from file: {path}")
+        with open(path, "rb") as key_file:
+            key_data = key_file.read()
+    
+    else:
+        print("❌ No private key found!")
+        print(f"   For GitHub Actions : Set SNOWFLAKE_PRIVATE_KEY_BASE64 secret")
+        print(f"   For local dev      : Place key at {path}")
+        sys.exit(1)
+
+    # Try without password first
+    try:
+        p_key = serialization.load_pem_private_key(
+            key_data,
+            password=None,
+            backend=default_backend()
+        )
+    except TypeError:
+        if key_password_bytes is None:
+            print("❌ Key is encrypted but PRIVATE_KEY_PASSWORD is not set")
+            sys.exit(1)
+        p_key = serialization.load_pem_private_key(
+            key_data,
+            password=key_password_bytes,
+            backend=default_backend()
+        )
+
     pkb = p_key.private_bytes(
         encoding=serialization.Encoding.DER,
         format=serialization.PrivateFormat.PKCS8,
