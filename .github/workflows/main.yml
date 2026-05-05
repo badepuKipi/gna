@@ -75,13 +75,17 @@ jobs:
           echo "Files to review:"
           find pr_files_to_review -name "*.py" -o -name "*.sql" || echo "No Python/SQL files to review"
       
-      - name: Create Private Key
+      - name: Write Snowflake private key
         run: |
           mkdir -p ~/.snowflake
-          printf '%s' "$PRIVATE_KEY_CONTENT" > ~/.snowflake/sf_private_key.p8
-          chmod 0600 ~/.snowflake/sf_private_key.p8
-        env:
-          PRIVATE_KEY_CONTENT: ${{ secrets.PRIVATE_KEY_PATH }}
+          echo "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > ~/.snowflake/sf_private_key.p8
+          chmod 600 ~/.snowflake/sf_private_key.p8
+
+      # 5. Validate the key is properly formatted
+      - name: Validate private key
+        run: |
+          openssl pkcs8 -in ~/.snowflake/sf_private_key.p8 -nocrypt -out /dev/null \
+            && echo "✅ Key is valid" || echo "❌ Key is malformed"
       
       - name: Run code review analysis
         run: python code_review_scripts/main.py pr_files_to_review ${{ steps.generate_dir_name.outputs.DYNAMIC_OUTPUT_DIR }} ${{ github.event.pull_request.number }} ${{ github.event.pull_request.head.sha }}
