@@ -1,0 +1,114 @@
+name: Code Review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install snowflake-connector-python tiktoken whatthepatch snowflake-snowpark-python snowflake-ml-python pandas requests cryptography
+      
+      - name: Generate dynamic output directory name
+        id: generate_dir_name
+        run: |
+          PR_CREATOR="${{ github.actor }}"
+          PR_CREATOR_CLEANED=$(echo "$PR_CREATOR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g')
+          TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
+          DYNAMIC_OUTPUT_DIR="reviews_${PR_CREATOR_CLEANED}_${TIMESTAMP}"
+          echo "Generated dynamic output directory name: $DYNAMIC_OUTPUT_DIR"
+          echo "DYNAMIC_OUTPUT_DIR=$DYNAMIC_OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+      
+      - name: Create output directory
+        run: mkdir -p ${{ steps.generate_dir_name.outputs.DYNAMIC_OUTPUT_DIR }}
+      
+      - name: Get changed files
+        id: changed-files
+        run: |
+          echo "Getting files changed in PR..."
+          git fetch origin ${{ github.base_ref }}
+          
+          # Get changed files and save to a file (handles spaces in filenames)
+          git diff --name-only origin/${{ github.base_ref }}...${{ github.sha }} | grep -E "\.(py|sql)$" | grep -v "^code_review_scripts/" > changed_files.txt || true
+          
+          echo "Changed Python/SQL files (excluding code_review_scripts/):"
+          cat changed_files.txt
+          
+          mkdir -p pr_files_to_review
+          
+          # Read file line by line to handle spaces in filenames
+          while IFS= read -r file; do
+            if [ -f "$file" ]; then
+              echo "Copying: $file"
+              mkdir -p "pr_files_to_review/$(dirname "$file")"
+              cp "$file" "pr_files_to_review/$file"
+            fi
+          done < changed_files.txt
+          
+          echo "Files copied to pr_files_to_review/ for review:"
+          find pr_files_to_review -type f || echo "No files to review"
+      
+      - name: Debug environment
+        run: |
+          echo "Repository: ${{ github.repository }}"
+          echo "PR Number: ${{ github.event.pull_request.number }}"
+          echo "Head SHA: ${{ github.event.pull_request.head.sha }}"
+          echo "Output Directory: ${{ steps.generate_dir_name.outputs.DYNAMIC_OUTPUT_DIR }}"
+          echo "Files to review:"
+          find pr_files_to_review -name "*.py" -o -name "*.sql" || echo "No Python/SQL files to review"
+      
+      - name: Create Private Key
+        run: |
+          mkdir -p ~/.snowflake
+          cat <<EOT > ~/.snowflake/sf_private_key.p8
+          ${{ secrets.PRIVATE_KEY_PATH }}
+          EOT
+          chmod 0600 ~/.snowflake/sf_private_key.p8
+      
+      - name: Run code review analysis
+        run: python code_review_scripts/main.py pr_files_to_review ${{ steps.generate_dir_name.outputs.DYNAMIC_OUTPUT_DIR }} ${{ github.event.pull_request.number }} ${{ github.event.pull_request.head.sha }}
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      
+      - name: Copy review_output.json to root
+        run: |
+          if [ -f "${{ steps.generate_dir_name.outputs.DYNAMIC_OUTPUT_DIR }}/review_output.json" ]; then
+            cp ${{ steps.generate_dir_name.outputs.DYNAMIC_OUTPUT_DIR }}/review_output.json ./review_output.json
+            echo "Copied review_output.json to root directory"
+          else
+            echo "review_output.json not found in output directory"
+          fi
+      
+      - name: Upload review outputs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: review-outputs-${{ github.actor }}-${{ github.run_number }}
+          path: ${{ steps.generate_dir_name.outputs.DYNAMIC_OUTPUT_DIR }}/
+      
+      - name: Post review comments
+        run: python code_review_scripts/inline_comment.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+        continue-on-error: true
