@@ -5,7 +5,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
 
-PRIVATE_KEY_PATH = "sf_private_key.p8"
+PRIVATE_KEY_PATH = os.path.expanduser("~/.snowflake/sf_private_key.p8")
 
 def load_private_key(path=PRIVATE_KEY_PATH):
     """Load private key and convert to DER bytes for Snowflake"""
